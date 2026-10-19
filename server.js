@@ -2,172 +2,207 @@
 import express from "express";
 import cors from "cors";
 import axios from "axios";
+import fs from "fs";
+import path from "path";
+import os from "os";
 
 const app = express();
 const PORT = process.env.PORT || 4000;
 app.use(cors({ origin: "*" }));
 app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
 
 function sanitize(name) {
   return name.replace(/[<>:"/\\|?*]/g, '').replace(/\s+/g, '_').substring(0,80) || 'video';
 }
-
-console.log("=== Laqta V33 - NO YTDLP - Pure API ===");
-
-// TikTok - tikwm
-async function getTikTok(url) {
-  console.log("[TikTok] Fetching:", url.substring(0,60));
-  const res = await axios.post('https://www.tikwm.com/api/', { url }, {
-    headers: { 'Content-Type': 'application/json', 'User-Agent': 'Mozilla/5.0' },
-    timeout: 20000
-  });
-  if (!res.data?.data) throw new Error("tikwm empty");
-  const d = res.data.data;
-  console.log("[TikTok] Success:", d.title?.substring(0,40));
-  const qualities = [];
-  if (d.hdplay) qualities.push({ height: 1080, quality: "1080p", label: "1080p HD - بدون علامة", url: d.hdplay, direct: true });
-  if (d.play) qualities.push({ height: 720, quality: "720p", label: "720p - بدون علامة", url: d.play, direct: true });
-  if (qualities.length===0) throw new Error("No TikTok URLs");
-  return {
-    title: d.title || "TikTok Video",
-    author: d.author?.nickname || "TikTok",
-    cover: d.cover || "",
-    qualities,
-    originalUrl: url,
-    safeTitle: sanitize(d.title || "tiktok"),
-    platform: "TikTok"
-  };
+function asciiFile(name, ext) {
+  const ascii = name.replace(/[^\w\s-]/g, '').replace(/\s+/g, '_').substring(0,30) || 'video';
+  return /[a-zA-Z0-9]/.test(ascii) ? `${ascii}.${ext}` : `laqta-video.${ext}`;
 }
 
-// All platforms via cobalt API (supports YouTube, Instagram, Facebook, Twitter, etc)
-async function getViaCobalt(url) {
-  console.log("[Cobalt] Fetching:", url.substring(0,60));
-  // cobalt API - public instance
-  const res = await axios.post('https://co.wuk.sh/api/json', {
-    url: url,
-    vQuality: "1080",
-    filenamePattern: "basic",
-    isAudioOnly: false
-  }, {
-    headers: {
-      'Accept': 'application/json',
-      'Content-Type': 'application/json',
-      'User-Agent': 'Mozilla/5.0'
-    },
-    timeout: 30000
-  });
+async function getInfo(url) {
+  const mod = await import('yt-dlp-exec');
+  const youtubedlp = mod.default || mod;
+  const isSnap = url.includes("snapchat");
   
-  console.log("[Cobalt] Response:", JSON.stringify(res.data).substring(0,500));
+  const tries = isSnap ? [
+    { name: "snapchat", opts: { dumpSingleJson: true, noWarnings: true, noPlaylist: true } }
+  ] : [
+    { name: "web", opts: { dumpSingleJson: true, noWarnings: true, noPlaylist: true } },
+    { name: "android", opts: { dumpSingleJson: true, noWarnings: true, noPlaylist: true, extractorArgs: "youtube:player_client=android" } }
+  ];
   
-  if (!res.data || res.data.status === "error") {
-    throw new Error(res.data?.text || "Cobalt error");
-  }
-  
-  // Cobalt returns url or picker
-  let qualities = [];
-  if (res.data.picker) {
-    // Multiple qualities
-    for (const item of res.data.picker) {
-      const h = item.url?.includes('1080') ? 1080 : item.url?.includes('720') ? 720 : 480;
-      qualities.push({
-        height: h,
-        quality: `${h}p`,
-        label: `${h}p`,
-        url: item.url,
-        direct: true
-      });
-    }
-  } else if (res.data.url) {
-    qualities.push({
-      height: 720,
-      quality: "720p",
-      label: "MP4",
-      url: res.data.url,
-      direct: true
-    });
-  }
-  
-  if (qualities.length===0) throw new Error("Cobalt returned no URL");
-  
-  return {
-    title: res.data.filename || "Video",
-    author: "User",
-    cover: "",
-    qualities: qualities.sort((a,b)=>b.height-a.height),
-    originalUrl: url,
-    safeTitle: sanitize(res.data.filename || "video"),
-    platform: "Video"
-  };
-}
-
-app.get("/api/info", async (req,res)=>{
-  const { url } = req.query;
-  console.log("\n>>> /api/info:", url);
-  if (!url) return res.status(400).json({ error: "الرابط ناقص" });
-  
-  try {
-    let data;
-    if (url.includes('tiktok.com') || url.includes('vm.tiktok') || url.includes('vt.tiktok')) {
-      try {
-        data = await getTikTok(url);
-      } catch (e) {
-        console.log("TikTok failed, trying Cobalt fallback:", e.message);
-        data = await getViaCobalt(url);
+  for (const t of tries) {
+    try {
+      const info = await youtubedlp(url, t.opts);
+      
+      let qualities = [];
+      const seen = new Set();
+      
+      if (isSnap) {
+        qualities.push({ height: 720, quality: "720p", label: "MP4 - الأصلية", ext: 'mp4' });
+      } else {
+        // خذ كل الجودات - فضل الأفضل جودة (أعلى bitrate)
+        const allVideos = (info.formats || [])
+          .filter(f => f.vcodec !== 'none' && f.height)
+          .sort((a,b) => {
+            // نفس الارتفاع، فضل الأعلى bitrate
+            if (a.height === b.height) return (b.tbr || b.bitrate || 0) - (a.tbr || a.bitrate || 0);
+            return b.height - a.height;
+          });
+        
+        for (const f of allVideos) {
+          if (seen.has(f.height)) continue;
+          if (f.height < 144) continue;
+          qualities.push({
+            height: f.height,
+            quality: `${f.height}p`,
+            label: f.height >= 2160 ? `${f.height}p 4K` : f.height >= 1440 ? `${f.height}p 2K` : `${f.height}p`,
+            ext: 'mp4'
+          });
+          seen.add(f.height);
+        }
       }
-    } else {
-      data = await getViaCobalt(url);
+      
+      qualities = qualities.sort((a,b) => b.height - a.height);
+      
+      if (qualities.length > 0) {
+        return {
+          title: info.title || (isSnap ? "Snapchat Video" : "Video"),
+          author: info.uploader || info.channel || (isSnap ? "Snapchat" : "User"),
+          cover: info.thumbnail || "",
+          qualities: qualities,
+          originalUrl: url,
+          safeTitle: sanitize(info.title || "video"),
+          method: t.name,
+          duration: info.duration,
+          durationStr: info.duration ? `${Math.floor(info.duration/60)}د ${info.duration%60}ث` : ""
+        };
+      }
+    } catch (e) {
+      console.log(`FAILED ${t.name}: ${e.message?.substring(0,500)}`);
     }
-    console.log("SUCCESS:", data.platform, data.qualities.length, "qualities");
+  }
+  return null;
+}
+
+app.get("/api/info", async (req, res) => {
+  const { url } = req.query;
+  if (!url) return res.status(400).json({ error: "URL missing" });
+  try {
+    let data = await getInfo(url);
+    if (!data) return res.status(500).json({ error: "فشل جلب الفيديو" });
     res.json({ success: true, ...data });
   } catch (err) {
-    console.error("ERROR /api/info:", err.message, err.response?.data);
-    res.status(500).json({ 
-      error: err.message || "فشل جلب الفيديو",
-      details: err.response?.data || err.stack?.substring(0,300)
-    });
+    res.status(500).json({ error: err.message });
   }
 });
 
-app.get("/api/download", async (req,res)=>{
-  const { title, directUrl, originalUrl } = req.query;
-  const videoUrl = directUrl || originalUrl;
-  console.log(">>> /api/download:", videoUrl?.substring(0,80));
-  if (!videoUrl) return res.status(400).send("url missing");
+app.get("/api/download", async (req, res) => {
+  const { title, quality, originalUrl } = req.query;
+  const targetUrl = originalUrl;
+  if (!targetUrl) return res.status(400).send("url missing");
   
+  const height = parseInt(quality) || 720;
   const safeTitle = sanitize(title || "video");
+  const asciiName = asciiFile(safeTitle, 'mp4');
   const encodedName = encodeURIComponent(safeTitle + '.mp4');
+  const isSnap = targetUrl.includes("snapchat");
+  
+  console.log(`\nDOWNLOAD ${height}p: ${safeTitle} | snap=${isSnap}\n`);
+  
+  res.setHeader("Content-Disposition", `attachment; filename="${asciiName}"; filename*=UTF-8''${encodedName}`);
+  res.setHeader("Content-Type", "video/mp4");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("X-Accel-Buffering", "no");
   
   try {
-    const response = await axios({
-      method: 'GET',
-      url: videoUrl,
-      responseType: 'stream',
-      headers: { 'User-Agent': 'Mozilla/5.0' },
-      timeout: 60000
-    });
+    const mod = await import('yt-dlp-exec');
+  const youtubedlp = mod.default || mod;
+    const tmpFile = path.join(os.tmpdir(), `laqta_${Date.now()}_${height}p.mp4`);
     
-    res.setHeader("Content-Disposition", `attachment; filename*=UTF-8''${encodedName}`);
-    res.setHeader("Content-Type", "video/mp4");
-    if (response.headers['content-length']) {
-      res.setHeader("Content-Length", response.headers['content-length']);
+    let formatStr;
+    if (isSnap) {
+      formatStr = "best[ext=mp4]/best";
+    } else {
+      // V28: أفضل جودة بدون تغبيش - خذ أعلى bitrate لنفس الارتفاع
+      // لا نفضل H264 على حساب الجودة، نأخذ الأفضل جودة حقيقية
+      // الترتيب: أفضل فيديو بهذا الارتفاع (أعلى bitrate) + أفضل صوت
+      if (height >= 2160) {
+        // 4K: خذ أفضل 4K (VP9 أفضل جودة من AV1 الخفيف) + صوت
+        formatStr = `bestvideo[height=${height}]+bestaudio/bestvideo[height<=${height}]+bestaudio/best[height<=${height}]`;
+      } else if (height >= 1080) {
+        // 1080p: MP4 H264 عالي الجودة
+        formatStr = `bestvideo[height=${height}][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height=${height}]+bestaudio/bestvideo[height<=${height}][ext=mp4]+bestaudio/best[height<=${height}]`;
+      } else {
+        formatStr = `bestvideo[height=${height}][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=${height}]+bestaudio/best[height<=${height}]`;
+      }
     }
     
-    response.data.pipe(res);
+    console.log(`Format (best quality): ${formatStr}`);
+    
+    await youtubedlp(targetUrl, {
+      format: formatStr,
+      output: tmpFile,
+      mergeOutputFormat: "mp4",
+      noWarnings: true,
+      noPlaylist: true
+    });
+    
+    if (!fs.existsSync(tmpFile)) return res.status(500).end("Failed");
+    
+    const stat = fs.statSync(tmpFile);
+    console.log(`Ready: ${(stat.size/1024/1024).toFixed(2)} MB - best quality`);
+    
+    res.setHeader("Content-Length", stat.size);
+    
+    const stream = fs.createReadStream(tmpFile);
+    stream.pipe(res);
+    stream.on('end', () => { try { fs.unlinkSync(tmpFile); } catch {} });
+    
   } catch (e) {
-    console.error("Download error:", e.message);
-    res.status(500).send("فشل التحميل: " + e.message);
+    console.error("Download failed:", e.message);
+    if (!res.headersSent) res.status(500).send("Failed: " + e.message);
+    else res.end();
   }
 });
 
-app.get("/api/test", async (req,res)=>{
-  res.json({ status: "OK", version: "V33 NO-YTDLP", time: new Date().toISOString() });
+app.get("/api/download-mp3", async (req, res) => {
+  const { originalUrl, title } = req.query;
+  const targetUrl = originalUrl;
+  if (!targetUrl) return res.status(400).send("url missing");
+  
+  const safeTitle = sanitize(title || "audio");
+  const asciiName = asciiFile(safeTitle, 'mp3');
+  const encodedName = encodeURIComponent(safeTitle + '.mp3');
+  
+  res.setHeader("Content-Disposition", `attachment; filename="${asciiName}"; filename*=UTF-8''${encodedName}`);
+  res.setHeader("Content-Type", "audio/mpeg");
+  res.setHeader("Cache-Control", "no-cache");
+  
+  try {
+    const mod = await import('yt-dlp-exec');
+  const youtubedlp = mod.default || mod;
+    const tmp = path.join(os.tmpdir(), `laqta_${Date.now()}.mp3`);
+    await youtubedlp(targetUrl, {
+      extractAudio: true,
+      audioFormat: "mp3",
+      audioQuality: 0,
+      output: tmp,
+      noWarnings: true,
+      noPlaylist: true
+    });
+    if (!fs.existsSync(tmp)) return res.status(500).end("MP3 failed");
+    const stat = fs.statSync(tmp);
+    res.setHeader("Content-Length", stat.size);
+    const s = fs.createReadStream(tmp);
+    s.pipe(res);
+    s.on('end', () => { try { fs.unlinkSync(tmp); } catch {} });
+  } catch (e) {
+    if (!res.headersSent) res.status(500).send("MP3 failed");
+    else res.end();
+  }
 });
 
-app.get("/", (req,res)=> res.json({ 
-  status: "Laqta V33 - 6 Platforms - NO YT-DLP - Live ✓",
-  endpoints: ["/api/info?url=...", "/api/download?directUrl=...", "/api/test"],
-  platforms: ["TikTok (tikwm)", "YouTube/Instagram/Facebook/Twitter via Cobalt"]
-}));
+app.get("/", (req,res)=> res.json({ status: "Laqta v28 FIXED - Live ✓", port: PORT, platforms: ["TikTok","YouTube","Instagram","Facebook","Twitter","Snapchat"] }));
 
-app.listen(PORT, ()=> console.log(`Laqta V33 NO-YTDLP on ${PORT}`));
+app.listen(PORT, () => console.log(`Laqta v28 FIXED on ${PORT} - 6 Platforms Ready`));
