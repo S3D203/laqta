@@ -7,7 +7,7 @@ import path from "path";
 import os from "os";
 
 const app = express();
-const PORT = 4000;
+const PORT = process.env.PORT || 4000;
 app.use(cors({ origin: "*" }));
 app.use(express.json());
 
