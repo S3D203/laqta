@@ -1,8 +1,7 @@
 {
-  "name": "laqta-backend-v35",
-  "version": "35.0.0-final",
+  "name": "laqta-backend-v28",
+  "version": "28.0.0-best-quality",
   "type": "module",
-  "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
@@ -11,8 +10,5 @@
     "cors": "^2.8.5",
     "axios": "^1.7.2",
     "yt-dlp-exec": "^1.0.2"
-  },
-  "engines": {
-    "node": ">=18.0.0"
   }
 }
