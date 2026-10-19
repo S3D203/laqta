@@ -24,13 +24,8 @@ async function getInfo(url) {
   const youtubedlp = mod.default || mod;
   const isSnap = url.includes("snapchat");
   
-  const isYoutube = url.includes("youtube.com") || url.includes("youtu.be");
   const tries = isSnap ? [
     { name: "snapchat", opts: { dumpSingleJson: true, noWarnings: true, noPlaylist: true } }
-  ] : isYoutube ? [
-    { name: "android", opts: { dumpSingleJson: true, noWarnings: true, noPlaylist: true, extractorArgs: "youtube:player_client=android" } },
-    { name: "ios", opts: { dumpSingleJson: true, noWarnings: true, noPlaylist: true, extractorArgs: "youtube:player_client=ios" } },
-    { name: "web", opts: { dumpSingleJson: true, noWarnings: true, noPlaylist: true } }
   ] : [
     { name: "web", opts: { dumpSingleJson: true, noWarnings: true, noPlaylist: true } },
     { name: "android", opts: { dumpSingleJson: true, noWarnings: true, noPlaylist: true, extractorArgs: "youtube:player_client=android" } }
@@ -103,8 +98,8 @@ app.get("/api/info", async (req, res) => {
 });
 
 app.get("/api/download", async (req, res) => {
-  const { title, quality, originalUrl, url, directUrl } = req.query;
-  const targetUrl = originalUrl || url || directUrl;
+  const { title, quality, originalUrl } = req.query;
+  const targetUrl = originalUrl;
   if (!targetUrl) return res.status(400).send("url missing");
   
   const height = parseInt(quality) || 720;
@@ -172,8 +167,8 @@ app.get("/api/download", async (req, res) => {
 });
 
 app.get("/api/download-mp3", async (req, res) => {
-  const { originalUrl, title, url, directUrl } = req.query;
-  const targetUrl = originalUrl || url || directUrl;
+  const { originalUrl, title } = req.query;
+  const targetUrl = originalUrl;
   if (!targetUrl) return res.status(400).send("url missing");
   
   const safeTitle = sanitize(title || "audio");
@@ -208,6 +203,6 @@ app.get("/api/download-mp3", async (req, res) => {
   }
 });
 
-app.get("/health", (req,res)=> res.json({ status: "ok", version: "V28 YouTube Fixed + MP3 + Title" }));
-app.get("/", (req,res)=> res.json({ status: "Laqta V28 Fixed - YouTube + MP3 + Title + Progress" }));
-app.listen(PORT, () => console.log(`Laqta V28 Fixed on ${PORT} - YouTube + MP3 + Title`));
+app.get("/health", (req,res)=> res.json({ status: "ok" }));
+app.get("/", (req,res)=> res.json({ status: "Laqta V28 Fixed" }));
+app.listen(PORT, () => console.log(`Laqta V28 Fixed on ${PORT}`));
