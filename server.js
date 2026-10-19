@@ -7,6 +7,7 @@ const ffmpegPath = require('@ffmpeg-installer/ffmpeg').path;
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const axios = require('axios');
 
 ffmpeg.setFfmpegPath(ffmpegPath);
 
@@ -16,19 +17,18 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 10000;
 
-// Try load yt-dlp-exec (optional but needed for non-youtube)
 let ytdlp = null;
 try {
   ytdlp = require('yt-dlp-exec');
-  console.log('✅ yt-dlp-exec loaded - all platforms enabled');
+  console.log('✅ yt-dlp-exec loaded');
 } catch (e) {
-  console.log('⚠️ yt-dlp-exec not found - youtube only mode');
+  console.log('⚠️ yt-dlp-exec not found');
 }
 
 function detectPlatform(url) {
   const u = url.toLowerCase();
   if (u.includes('youtube.com') || u.includes('youtu.be')) return 'youtube';
-  if (u.includes('tiktok.com')) return 'tiktok';
+  if (u.includes('tiktok.com') || u.includes('tt.site') || u.includes('vm.tiktok') || u.includes('vt.tiktok')) return 'tiktok';
   if (u.includes('instagram.com')) return 'instagram';
   if (u.includes('facebook.com') || u.includes('fb.watch')) return 'facebook';
   if (u.includes('twitter.com') || u.includes('x.com')) return 'twitter';
@@ -41,13 +41,26 @@ function sanitizeTitle(t) {
   return t.replace(/[<>:"/\\|?*\x00-\x1F]/g,'').replace(/\s+/g,'_').substring(0,80)||'video';
 }
 
-async function getYouTubeInfo(url) {
+// Resolve short URLs like tt.site, vm.tiktok
+async function resolveUrl(shortUrl) {
   try {
-    const info = await ytdl.getInfo(url);
-    return info;
+    const res = await axios.get(shortUrl, {
+      maxRedirects: 5,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15'
+      },
+      validateStatus: (s) => s < 400
+    });
+    // axios follows redirects, final url is in request
+    return res.request?.res?.responseUrl || res.request?._redirectable?._currentUrl || shortUrl;
   } catch (e) {
-    throw e;
+    return e.response?.request?.res?.responseUrl || shortUrl;
   }
+}
+
+async function getYouTubeInfo(url) {
+  const info = await ytdl.getInfo(url);
+  return info;
 }
 
 function filterYouTubeFormats(info) {
@@ -66,31 +79,114 @@ function filterYouTubeFormats(info) {
     videoOnly.forEach(f=>{
       const h=f.height||0;
       if(h>=144 && !map.has(h)){
-        map.set(h,{height:h, quality:h+'p', label:h+'p (دمج)', bitrate:f.bitrate, hasAudio:false, format:f, needsMux:true});
+        map.set(h,{height:h, quality:h+'p', label:h+'p (دمج)', bitrate:f.bitrate, hasAudio:false, format:f});
       }
     });
   }
   return {qualities:Array.from(map.values()).sort((a,b)=>b.height-a.height), videoWithAudio, videoOnly, audioOnly};
 }
 
-// ================= INFO - منفصل لكل منصة =================
+// TikTok with better options and fallback
+async function getTikTokInfoWithFallback(url) {
+  if (!ytdlp) throw new Error('yt-dlp not loaded');
+  
+  let finalUrl = url;
+  // Resolve short url first
+  if (url.includes('tt.site') || url.includes('vm.tiktok') || url.includes('vt.tiktok')) {
+    try {
+      finalUrl = await resolveUrl(url);
+      console.log(`[TikTok] Resolved ${url} -> ${finalUrl.substring(0,100)}`);
+    } catch (e) {
+      console.log(`[TikTok] Resolve failed, using original`);
+    }
+  }
+
+  const ytDlpOptions = {
+    dumpSingleJson: true,
+    noPlaylist: true,
+    noWarnings: true,
+    noCheckCertificates: true,
+    addHeader: [
+      'User-Agent:Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1',
+      'Referer:https://www.tiktok.com/'
+    ]
+  };
+
+  try {
+    const info = await ytdlp(finalUrl, ytDlpOptions);
+    return info;
+  } catch (e1) {
+    console.log(`[TikTok] First try failed: ${e1.message.substring(0,200)}`);
+    // Retry with different options - without addHeader, with extractor args
+    try {
+      const info2 = await ytdlp(finalUrl, {
+        dumpSingleJson: true,
+        noPlaylist: true,
+        extractorArgs: 'tiktok:api_hostname=api16-normal-c-useast2a.tiktokv.com'
+      });
+      return info2;
+    } catch (e2) {
+      console.log(`[TikTok] Second try failed: ${e2.message.substring(0,200)}`);
+      throw new Error(`TikTok محظور مؤقتاً من السيرفر. جرب رابط مباشر من tiktok.com بدون tt.site. الخطأ: ${e1.message.substring(0,100)}`);
+    }
+  }
+}
+
 app.get('/api/info', async (req,res)=>{
   const {url}=req.query;
   if(!url) return res.status(400).json({error:'رابط مطلوب'});
   const platform = detectPlatform(url);
-  console.log(`[INFO] ${platform} | ${url.substring(0,80)}`);
+  console.log(`[INFO] ${platform} | ${url.substring(0,100)}`);
   try{
     if(platform==='youtube'){
       const info = await getYouTubeInfo(url);
       const {qualities}=filterYouTubeFormats(info);
-      return res.json({platform:'youtube', title:info.videoDetails.title, safeTitle:sanitizeTitle(info.videoDetails.title), author:info.videoDetails.author?.name||'', duration:parseInt(info.videoDetails.lengthSeconds)||0, durationStr:'', cover:info.videoDetails.thumbnails?.slice(-1)[0]?.url||'', qualities, originalUrl:url, method:'ytdl-isolated'});
+      return res.json({platform:'youtube', title:info.videoDetails.title, safeTitle:sanitizeTitle(info.videoDetails.title), author:info.videoDetails.author?.name||'', duration:parseInt(info.videoDetails.lengthSeconds)||0, cover:info.videoDetails.thumbnails?.slice(-1)[0]?.url||'', qualities, originalUrl:url, method:'ytdl-isolated'});
+    } else if(platform==='tiktok'){
+      try{
+        const info = await getTikTokInfoWithFallback(url);
+        return res.json({platform:'tiktok', title:info.title||'TikTok Video', safeTitle:sanitizeTitle(info.title||'tiktok'), author:info.uploader||'', duration:info.duration||0, cover:info.thumbnail||'', qualities:[{height:720, quality:'720p', label:'HD - بدون علامة مائية', hasAudio:true}], originalUrl:url, method:'yt-dlp-tiktok-isolated'});
+      }catch(e){
+        console.error(`[TikTok INFO ERROR]:`, e.message);
+        // Isolated error - return 200 with fallback so frontend shows message but other platforms work
+        return res.status(200).json({
+          platform:'tiktok',
+          title:'TikTok Video',
+          safeTitle:'tiktok_video',
+          author:'',
+          duration:0,
+          cover:'',
+          qualities:[],
+          originalUrl:url,
+          method:'tiktok-fallback',
+          warning: e.message,
+          errorIsolated: true,
+          suggestion: 'جرب رابط tiktok.com مباشر بدل tt.site، أو حدث yt-dlp: pip install -U yt-dlp'
+        });
+      }
     } else {
       if(!ytdlp){
-        // Fallback isolated info
         return res.json({platform, title:`${platform} Video`, safeTitle:`${platform}_video`, author:'', duration:0, cover:'', qualities:[{height:720, quality:'720p', label:'HD', hasAudio:true}], originalUrl:url, method:'isolated-fallback'});
       }
-      const info = await ytdlp(url,{dumpSingleJson:true, noPlaylist:true, noWarnings:true});
-      return res.json({platform, title:info.title||`${platform} Video`, safeTitle:sanitizeTitle(info.title||platform), author:info.uploader||'', duration:info.duration||0, cover:info.thumbnail||'', qualities:[{height:info.height||720, quality:(info.height||720)+'p', label:'HD', hasAudio:true}], originalUrl:url, method:'yt-dlp-isolated'});
+      try{
+        const info = await ytdlp(url,{dumpSingleJson:true, noPlaylist:true, noWarnings:true});
+        return res.json({platform, title:info.title||`${platform} Video`, safeTitle:sanitizeTitle(info.title||platform), author:info.uploader||'', duration:info.duration||0, cover:info.thumbnail||'', qualities:[{height:720, quality:'720p', label:'HD', hasAudio:true}], originalUrl:url, method:'yt-dlp-isolated'});
+      }catch(e){
+        console.error(`[${platform} INFO ERROR]:`, e.message);
+        // Isolated - don't crash other platforms
+        return res.status(200).json({
+          platform,
+          title:`${platform} Video`,
+          safeTitle:`${platform}_video`,
+          author:'',
+          duration:0,
+          cover:'',
+          qualities:[],
+          originalUrl:url,
+          warning: e.message,
+          errorIsolated: true
+        });
+      }
     }
   }catch(e){
     console.error(`[INFO ERROR] ${platform}:`,e.message);
@@ -98,7 +194,6 @@ app.get('/api/info', async (req,res)=>{
   }
 });
 
-// ================= DOWNLOAD MP4 - منفصل =================
 app.get('/api/download', async (req,res)=>{
   const {url, quality, title}=req.query;
   if(!url) return res.status(400).json({error:'رابط مطلوب'});
@@ -138,24 +233,39 @@ app.get('/api/download', async (req,res)=>{
       }
       return;
     }else{
-      if(!ytdlp) return res.status(500).json({error:`${platform} يحتاج yt-dlp-exec - ثبته`, platform, isolated:true});
+      if(!ytdlp) return res.status(500).json({error:`${platform} يحتاج yt-dlp`, platform, isolated:true});
+      
+      // For tiktok, resolve short url first
+      let finalUrl = url;
+      if(platform==='tiktok' && (url.includes('tt.site') || url.includes('vm.tiktok') || url.includes('vt.tiktok'))){
+        try{ finalUrl = await resolveUrl(url); }catch(e){}
+      }
+      
       const tempFile = path.join(os.tmpdir(), `${Date.now()}_${safeTitle}.mp4`);
-      await ytdlp(url,{output:tempFile, format:`best[height<=${quality||720}]`, noPlaylist:true, noWarnings:true});
-      // Find actual file (yt-dlp may add ext)
+      try{
+        await ytdlp(finalUrl,{
+          output: tempFile,
+          format: `best[height<=${quality||720}]`,
+          noPlaylist: true,
+          noWarnings: true,
+          addHeader: platform==='tiktok' ? ['User-Agent:Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15'] : []
+        });
+      }catch(e){
+        console.error(`[${platform} DL ERROR]:`, e.message);
+        return res.status(500).json({error:`${platform}: ${e.message.substring(0,200)} - جرب رابط مباشر`, platform, isolated:true});
+      }
+      
       let finalFile = tempFile;
       if(!fs.existsSync(tempFile)){
-        const files = fs.readdirSync(os.tmpdir()).filter(f=>f.includes(String(Date.now()).substring(0,8)));
-        // try find mp4
-        const found = fs.readdirSync(os.tmpdir()).find(f=>f.endsWith('.mp4') && f.includes(safeTitle.substring(0,10)));
-        if(found) finalFile = path.join(os.tmpdir(), found);
-      }
-      if(!fs.existsSync(finalFile)){
-        // fallback: use tempFile.mp4
         finalFile = tempFile+'.mp4';
       }
       if(!fs.existsSync(finalFile)){
-        throw new Error('فشل تحميل الملف من yt-dlp');
+        // search
+        const found = fs.readdirSync(os.tmpdir()).find(f=>f.includes(safeTitle.substring(0,10)) && f.endsWith('.mp4'));
+        if(found) finalFile = path.join(os.tmpdir(), found);
       }
+      if(!fs.existsSync(finalFile)) throw new Error('فشل تحميل');
+      
       res.setHeader('Content-Disposition',`attachment; filename="${encodeURIComponent(filename)}"`);
       res.setHeader('Content-Type','video/mp4');
       res.setHeader('Content-Length',fs.statSync(finalFile).size);
@@ -168,7 +278,6 @@ app.get('/api/download', async (req,res)=>{
   }
 });
 
-// ================= DOWNLOAD MP3 - منفصل =================
 app.get('/api/download-mp3', async (req,res)=>{
   const {url, title}=req.query;
   if(!url) return res.status(400).json({error:'رابط مطلوب'});
@@ -193,19 +302,22 @@ app.get('/api/download-mp3', async (req,res)=>{
           .on('end',()=>{ res.setHeader('Content-Length',fs.statSync(tmpM).size); fs.createReadStream(tmpM).pipe(res).on('finish',()=>{ try{fs.unlinkSync(tmpA);fs.unlinkSync(tmpM);}catch(e){} }); })
           .on('error',e=>{ if(!res.headersSent) res.status(500).json({error:e.message}); });
       });
-      stream.on('error',e=>{ if(!res.headersSent) res.status(500).json({error:e.message}); });
       return;
     }else{
-      if(!ytdlp) return res.status(500).json({error:`${platform} MP3 يحتاج yt-dlp-exec`, platform, isolated:true});
+      if(!ytdlp) return res.status(500).json({error:`${platform} MP3 يحتاج yt-dlp`, platform, isolated:true});
+      let finalUrl = url;
+      if(platform==='tiktok' && (url.includes('tt.site') || url.includes('vm.tiktok'))){
+        try{ finalUrl = await resolveUrl(url); }catch(e){}
+      }
       const tempBase = path.join(os.tmpdir(), `${Date.now()}_${safeTitle}`);
-      await ytdlp(url,{output:tempBase+'.%(ext)s', extractAudio:true, audioFormat:'mp3', audioQuality:0, noPlaylist:true});
+      await ytdlp(finalUrl,{output:tempBase+'.%(ext)s', extractAudio:true, audioFormat:'mp3', audioQuality:0, noPlaylist:true});
       const mp3File = tempBase+'.mp3';
       let finalFile = mp3File;
       if(!fs.existsSync(mp3File)){
         const found = fs.readdirSync(os.tmpdir()).find(f=>f.startsWith(path.basename(tempBase)) && f.endsWith('.mp3'));
         if(found) finalFile = path.join(os.tmpdir(), found);
       }
-      if(!fs.existsSync(finalFile)) throw new Error('فشل تحويل MP3');
+      if(!fs.existsSync(finalFile)) throw new Error('فشل MP3');
       res.setHeader('Content-Disposition',`attachment; filename="${encodeURIComponent(filename)}"`);
       res.setHeader('Content-Type','audio/mpeg');
       res.setHeader('Content-Length',fs.statSync(finalFile).size);
@@ -218,7 +330,7 @@ app.get('/api/download-mp3', async (req,res)=>{
   }
 });
 
-app.get('/health',(req,res)=>{ res.json({status:'ok', version:'V32-full-isolated', platforms:['youtube','tiktok','instagram','facebook','twitter','snapchat'], isolated:true, ytdlp:!!ytdlp, features:['mp4','mp3','anti-ban'], ts:new Date().toISOString()}); });
-app.get('/',(req,res)=>{ res.json({name:'LAQTA V32 Full Isolated', message:'كل منصة معزولة - يوتيوب + تيك توك + انستا + فيسبوك + تويتر + سناب', ytdlp:!!ytdlp}); });
+app.get('/health',(req,res)=>{ res.json({status:'ok', version:'V33-tiktok-fix', platforms:['youtube','tiktok','instagram','facebook','twitter','snapchat'], isolated:true, ytdlp:!!ytdlp, fix:'tt.site resolved + isolated errors', ts:new Date().toISOString()}); });
+app.get('/',(req,res)=>{ res.json({name:'LAQTA V33 TikTok Fix', message:'تيك توك مصلح - يدعم tt.site + معزول', ytdlp:!!ytdlp}); });
 
-app.listen(PORT,()=>{ console.log(`🚀 LAQTA V32 Full Isolated on ${PORT} | yt-dlp: ${!!ytdlp}`); });
+app.listen(PORT,()=>{ console.log(`🚀 LAQTA V33 TikTok Fix on ${PORT} | yt-dlp: ${!!ytdlp}`); });
