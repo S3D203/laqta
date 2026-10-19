@@ -1,6 +1,6 @@
 {
-  "name": "laqta-backend-v34",
-  "version": "34.0.0-final-fixes",
+  "name": "laqta-backend-v35",
+  "version": "35.0.0-final",
   "type": "module",
   "main": "server.js",
   "scripts": {
