@@ -4,7 +4,6 @@ const cors = require('cors');
 const ytdl = require('@distube/ytdl-core');
 const ffmpeg = require('fluent-ffmpeg');
 const ffmpegPath = require('@ffmpeg-installer/ffmpeg').path;
-const axios = require('axios');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
@@ -17,10 +16,18 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 10000;
 
-// ================= PLATFORM DETECTOR =================
+// Try load yt-dlp-exec (optional but needed for non-youtube)
+let ytdlp = null;
+try {
+  ytdlp = require('yt-dlp-exec');
+  console.log('✅ yt-dlp-exec loaded - all platforms enabled');
+} catch (e) {
+  console.log('⚠️ yt-dlp-exec not found - youtube only mode');
+}
+
 function detectPlatform(url) {
   const u = url.toLowerCase();
-  if (u.includes('youtube.com') || u.includes('youtu.be') || u.includes('m.youtube')) return 'youtube';
+  if (u.includes('youtube.com') || u.includes('youtu.be')) return 'youtube';
   if (u.includes('tiktok.com')) return 'tiktok';
   if (u.includes('instagram.com')) return 'instagram';
   if (u.includes('facebook.com') || u.includes('fb.watch')) return 'facebook';
@@ -29,266 +36,189 @@ function detectPlatform(url) {
   return 'generic';
 }
 
-function sanitizeTitle(title) {
-  if (!title) return 'video';
-  return title.replace(/[<>:"/\\|?*\x00-\x1F]/g, '').replace(/\s+/g, '_').substring(0, 80) || 'video';
+function sanitizeTitle(t) {
+  if (!t) return 'video';
+  return t.replace(/[<>:"/\\|?*\x00-\x1F]/g,'').replace(/\s+/g,'_').substring(0,80)||'video';
 }
 
-// ================= YOUTUBE ISOLATED (V30 FIX) =================
 async function getYouTubeInfo(url) {
-  const clients = ['ANDROID', 'IOS', 'MWEB'];
-  let lastError = null;
-  for (const client of clients) {
-    try {
-      const info = await ytdl.getInfo(url);
-      if (info && info.videoDetails) {
-        console.log(`[YouTube] Success: ${info.videoDetails.title}`);
-        return info;
-      }
-    } catch (e) {
-      console.log(`[YouTube] ${client} failed: ${e.message}`);
-      lastError = e;
-    }
+  try {
+    const info = await ytdl.getInfo(url);
+    return info;
+  } catch (e) {
+    throw e;
   }
-  throw lastError || new Error('YouTube failed');
 }
 
 function filterYouTubeFormats(info) {
-  const formats = (info.formats || []).filter(f => f.url);
-  const videoWithAudio = formats.filter(f => f.hasVideo && f.hasAudio && f.container === 'mp4');
-  const videoOnly = formats.filter(f => f.hasVideo && !f.hasAudio);
-  const audioOnly = formats.filter(f => !f.hasVideo && f.hasAudio);
-  
-  const qualitiesMap = new Map();
-  videoWithAudio.forEach(f => {
-    const h = f.height || 0;
-    if (h >= 144) {
-      if (!qualitiesMap.has(h) || f.bitrate > (qualitiesMap.get(h).bitrate || 0)) {
-        qualitiesMap.set(h, { height: h, quality: h+'p', label: h+'p'+(h>=1080?' HD':''), bitrate: f.bitrate, hasAudio: true, format: f });
-      }
+  const formats = (info.formats||[]).filter(f=>f.url);
+  const videoWithAudio = formats.filter(f=>f.hasVideo&&f.hasAudio&&f.container==='mp4');
+  const videoOnly = formats.filter(f=>f.hasVideo&&!f.hasAudio);
+  const audioOnly = formats.filter(f=>!f.hasVideo&&f.hasAudio);
+  const map = new Map();
+  videoWithAudio.forEach(f=>{
+    const h=f.height||0;
+    if(h>=144 && (!map.has(h) || f.bitrate>(map.get(h).bitrate||0))){
+      map.set(h,{height:h, quality:h+'p', label:h+'p'+(h>=1080?' HD':''), bitrate:f.bitrate, hasAudio:true, format:f});
     }
   });
-  if (qualitiesMap.size === 0) {
-    videoOnly.forEach(f => {
-      const h = f.height || 0;
-      if (h >= 144 && !qualitiesMap.has(h)) {
-        qualitiesMap.set(h, { height: h, quality: h+'p', label: h+'p (دمج صوت)', bitrate: f.bitrate, hasAudio: false, format: f, needsMux: true });
+  if(map.size===0){
+    videoOnly.forEach(f=>{
+      const h=f.height||0;
+      if(h>=144 && !map.has(h)){
+        map.set(h,{height:h, quality:h+'p', label:h+'p (دمج)', bitrate:f.bitrate, hasAudio:false, format:f, needsMux:true});
       }
     });
   }
-  const qualities = Array.from(qualitiesMap.values()).sort((a,b) => b.height - a.height);
-  return { qualities, videoWithAudio, videoOnly, audioOnly, allFormats: formats };
+  return {qualities:Array.from(map.values()).sort((a,b)=>b.height-a.height), videoWithAudio, videoOnly, audioOnly};
 }
 
-// ================= TIKTOK ISOLATED (بدون yt-dlp) =================
-async function handleTikTokInfo(url) {
-  try {
-    // TikTok - نحاول نجيب معلومات بدون yt-dlp عبر no watermark API
-    // Isolated - لو فشل، باقي المنصات تشتغل
-    const idMatch = url.match(/\/video\/(\d+)/) || url.match(/\/v\/(\d+)/);
-    return {
-      platform: 'tiktok',
-      title: 'TikTok Video',
-      safeTitle: 'tiktok_video',
-      author: '',
-      duration: 0,
-      durationStr: '',
-      cover: '',
-      qualities: [{ height: 720, quality: '720p', label: 'HD - بدون علامة مائية', hasAudio: true }],
-      originalUrl: url,
-      method: 'isolated-no-ytdlp'
-    };
-  } catch (e) {
-    throw new Error(`TikTok: ${e.message}`);
-  }
-}
-
-// ================= INSTAGRAM ISOLATED =================
-async function handleInstagramInfo(url) {
-  return {
-    platform: 'instagram',
-    title: 'Instagram Video',
-    safeTitle: 'instagram_video',
-    author: '',
-    duration: 0,
-    cover: '',
-    qualities: [{ height: 720, quality: '720p', label: 'Original', hasAudio: true }],
-    originalUrl: url,
-    method: 'isolated'
-  };
-}
-
-// ================= FACEBOOK ISOLATED =================
-async function handleFacebookInfo(url) {
-  return {
-    platform: 'facebook',
-    title: 'Facebook Video',
-    safeTitle: 'facebook_video',
-    author: '',
-    duration: 0,
-    cover: '',
-    qualities: [{ height: 720, quality: '720p', label: 'HD', hasAudio: true }],
-    originalUrl: url,
-    method: 'isolated'
-  };
-}
-
-// ================= TWITTER ISOLATED =================
-async function handleTwitterInfo(url) {
-  return {
-    platform: 'twitter',
-    title: 'Twitter Video',
-    safeTitle: 'twitter_video',
-    author: '',
-    duration: 0,
-    cover: '',
-    qualities: [{ height: 720, quality: '720p', label: 'HD', hasAudio: true }],
-    originalUrl: url,
-    method: 'isolated'
-  };
-}
-
-// ================= SNAPCHAT ISOLATED =================
-async function handleSnapchatInfo(url) {
-  return {
-    platform: 'snapchat',
-    title: 'Snapchat Video',
-    safeTitle: 'snapchat_video',
-    author: '',
-    duration: 0,
-    cover: '',
-    qualities: [{ height: 720, quality: '720p', label: 'Original', hasAudio: true }],
-    originalUrl: url,
-    method: 'isolated'
-  };
-}
-
-// ================= INFO ROUTER =================
-app.get('/api/info', async (req, res) => {
-  const { url } = req.query;
-  if (!url) return res.status(400).json({ error: 'رابط مطلوب' });
+// ================= INFO - منفصل لكل منصة =================
+app.get('/api/info', async (req,res)=>{
+  const {url}=req.query;
+  if(!url) return res.status(400).json({error:'رابط مطلوب'});
   const platform = detectPlatform(url);
   console.log(`[INFO] ${platform} | ${url.substring(0,80)}`);
-  try {
-    let data;
-    switch(platform) {
-      case 'youtube': data = await (async()=>{ const info = await getYouTubeInfo(url); const {qualities}=filterYouTubeFormats(info); return { platform:'youtube', title:info.videoDetails.title, safeTitle:sanitizeTitle(info.videoDetails.title), author:info.videoDetails.author?.name||'', duration:parseInt(info.videoDetails.lengthSeconds)||0, durationStr:'', cover:info.videoDetails.thumbnails?.slice(-1)[0]?.url||'', qualities, originalUrl:url, method:'ytdl-isolated' }; })(); break;
-      case 'tiktok': data = await handleTikTokInfo(url); break;
-      case 'instagram': data = await handleInstagramInfo(url); break;
-      case 'facebook': data = await handleFacebookInfo(url); break;
-      case 'twitter': data = await handleTwitterInfo(url); break;
-      case 'snapchat': data = await handleSnapchatInfo(url); break;
-      default: data = await (async()=>{ const info = await getYouTubeInfo(url); const {qualities}=filterYouTubeFormats(info); return { platform:'generic', title:info.videoDetails.title, safeTitle:sanitizeTitle(info.videoDetails.title), author:'', duration:0, cover:'', qualities, originalUrl:url, method:'generic' }; })();
+  try{
+    if(platform==='youtube'){
+      const info = await getYouTubeInfo(url);
+      const {qualities}=filterYouTubeFormats(info);
+      return res.json({platform:'youtube', title:info.videoDetails.title, safeTitle:sanitizeTitle(info.videoDetails.title), author:info.videoDetails.author?.name||'', duration:parseInt(info.videoDetails.lengthSeconds)||0, durationStr:'', cover:info.videoDetails.thumbnails?.slice(-1)[0]?.url||'', qualities, originalUrl:url, method:'ytdl-isolated'});
+    } else {
+      if(!ytdlp){
+        // Fallback isolated info
+        return res.json({platform, title:`${platform} Video`, safeTitle:`${platform}_video`, author:'', duration:0, cover:'', qualities:[{height:720, quality:'720p', label:'HD', hasAudio:true}], originalUrl:url, method:'isolated-fallback'});
+      }
+      const info = await ytdlp(url,{dumpSingleJson:true, noPlaylist:true, noWarnings:true});
+      return res.json({platform, title:info.title||`${platform} Video`, safeTitle:sanitizeTitle(info.title||platform), author:info.uploader||'', duration:info.duration||0, cover:info.thumbnail||'', qualities:[{height:info.height||720, quality:(info.height||720)+'p', label:'HD', hasAudio:true}], originalUrl:url, method:'yt-dlp-isolated'});
     }
-    res.json(data);
-  } catch (e) {
-    console.error(`[INFO ERROR] ${platform}:`, e.message);
-    res.status(500).json({ error: e.message, platform, isolated: true });
+  }catch(e){
+    console.error(`[INFO ERROR] ${platform}:`,e.message);
+    res.status(500).json({error:`${platform}: ${e.message}`, platform, isolated:true});
   }
 });
 
-// ================= DOWNLOAD MP4 ISOLATED =================
-app.get('/api/download', async (req, res) => {
-  const { url, quality, title } = req.query;
-  if (!url) return res.status(400).json({ error: 'رابط مطلوب' });
+// ================= DOWNLOAD MP4 - منفصل =================
+app.get('/api/download', async (req,res)=>{
+  const {url, quality, title}=req.query;
+  if(!url) return res.status(400).json({error:'رابط مطلوب'});
   const platform = detectPlatform(url);
-  const safeTitle = sanitizeTitle(title || 'video');
+  const safeTitle = sanitizeTitle(title||'video');
   const filename = `${safeTitle}.mp4`;
   console.log(`[MP4] ${platform} | ${quality} | ${filename}`);
-  try {
-    if (platform === 'youtube') {
+  try{
+    if(platform==='youtube'){
       const info = await getYouTubeInfo(url);
-      const { videoWithAudio, videoOnly, audioOnly } = filterYouTubeFormats(info);
-      const targetHeight = parseInt(quality) || 720;
-      let videoFormat = videoWithAudio.find(f => f.format.height === targetHeight) || videoWithAudio.sort((a,b)=>Math.abs(a.height-targetHeight)-Math.abs(b.height-targetHeight))[0] || videoOnly.find(f=>f.format.height===targetHeight) || videoOnly[0];
-      if (!videoFormat) throw new Error('جودة غير موجودة');
-      res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(filename)}"`);
-      res.setHeader('Content-Type', 'video/mp4');
-      if (videoFormat.hasAudio) {
-        const stream = ytdl.downloadFromInfo(info, { format: videoFormat.format });
+      const {videoWithAudio, videoOnly, audioOnly}=filterYouTubeFormats(info);
+      const target = parseInt(quality)||720;
+      let vf = videoWithAudio.find(f=>f.height===target) || videoWithAudio.sort((a,b)=>Math.abs(a.height-target)-Math.abs(b.height-target))[0] || videoOnly.find(f=>f.format?.height===target) || videoOnly[0];
+      if(!vf) throw new Error('جودة غير موجودة');
+      res.setHeader('Content-Disposition',`attachment; filename="${encodeURIComponent(filename)}"`);
+      res.setHeader('Content-Type','video/mp4');
+      if(vf.hasAudio){
+        const stream = ytdl.downloadFromInfo(info,{format:vf.format});
         stream.pipe(res);
-        stream.on('error', e => { console.error(e); if(!res.headersSent) res.status(500).json({error:e.message}); });
-      } else {
-        const audioFormat = audioOnly.sort((a,b)=>b.bitrate-a.bitrate)[0] || info.formats.find(f=>f.hasAudio);
-        const tempDir = os.tmpdir();
-        const videoPath = path.join(tempDir, `v_${Date.now()}.mp4`);
-        const audioPath = path.join(tempDir, `a_${Date.now()}.mp4`);
-        const outputPath = path.join(tempDir, `out_${Date.now()}.mp4`);
-        const downloadFile = (fmt, fp) => new Promise((resolve, reject) => {
-          const s = ytdl.downloadFromInfo(info, { format: fmt.format || fmt });
+        stream.on('error',e=>{ if(!res.headersSent) res.status(500).json({error:e.message}); });
+      }else{
+        const af = audioOnly.sort((a,b)=>b.bitrate-a.bitrate)[0] || info.formats.find(f=>f.hasAudio);
+        const tmp = os.tmpdir();
+        const vp = path.join(tmp,`v_${Date.now()}.mp4`);
+        const ap = path.join(tmp,`a_${Date.now()}.mp4`);
+        const op = path.join(tmp,`out_${Date.now()}.mp4`);
+        const dl = (fmt,fp)=>new Promise((resolve,reject)=>{
+          const s = ytdl.downloadFromInfo(info,{format:fmt.format||fmt});
           const ws = fs.createWriteStream(fp);
-          s.pipe(ws); ws.on('finish', resolve); ws.on('error', reject); s.on('error', reject);
+          s.pipe(ws); ws.on('finish',resolve); ws.on('error',reject); s.on('error',reject);
         });
-        await downloadFile(videoFormat, videoPath);
-        await downloadFile({format:audioFormat}, audioPath);
-        ffmpeg().input(videoPath).input(audioPath).outputOptions(['-c:v copy','-c:a aac','-shortest']).save(outputPath)
-          .on('end', () => {
-            res.setHeader('Content-Length', fs.statSync(outputPath).size);
-            fs.createReadStream(outputPath).pipe(res).on('finish', () => { try{fs.unlinkSync(videoPath);fs.unlinkSync(audioPath);fs.unlinkSync(outputPath);}catch(e){} });
-          })
-          .on('error', e => { console.error(e); if(!res.headersSent) res.status(500).json({error:'فشل دمج'}); });
+        await dl(vf,vp);
+        await dl({format:af},ap);
+        ffmpeg().input(vp).input(ap).outputOptions(['-c:v copy','-c:a aac','-shortest']).save(op)
+          .on('end',()=>{ res.setHeader('Content-Length',fs.statSync(op).size); fs.createReadStream(op).pipe(res).on('finish',()=>{ try{fs.unlinkSync(vp);fs.unlinkSync(ap);fs.unlinkSync(op);}catch(e){} }); })
+          .on('error',e=>{ if(!res.headersSent) res.status(500).json({error:'فشل دمج'}); });
       }
       return;
-    } else {
-      // For other platforms, redirect to external downloader or return error with isolated flag
-      // Since we don't have yt-dlp binary, we tell frontend to use youtube-dl server or keep working
-      // But to keep isolated, we return MP4 via ytdl if possible, else error isolated
-      return res.status(501).json({ error: `${platform} يحتاج yt-dlp binary - استخدم يوتيوب حاليا والباقي سيتم تفعيله`, platform, isolated: true, suggestion: 'استخدم باك إند مع yt-dlp-exec@0.5.0 محليا' });
+    }else{
+      if(!ytdlp) return res.status(500).json({error:`${platform} يحتاج yt-dlp-exec - ثبته`, platform, isolated:true});
+      const tempFile = path.join(os.tmpdir(), `${Date.now()}_${safeTitle}.mp4`);
+      await ytdlp(url,{output:tempFile, format:`best[height<=${quality||720}]`, noPlaylist:true, noWarnings:true});
+      // Find actual file (yt-dlp may add ext)
+      let finalFile = tempFile;
+      if(!fs.existsSync(tempFile)){
+        const files = fs.readdirSync(os.tmpdir()).filter(f=>f.includes(String(Date.now()).substring(0,8)));
+        // try find mp4
+        const found = fs.readdirSync(os.tmpdir()).find(f=>f.endsWith('.mp4') && f.includes(safeTitle.substring(0,10)));
+        if(found) finalFile = path.join(os.tmpdir(), found);
+      }
+      if(!fs.existsSync(finalFile)){
+        // fallback: use tempFile.mp4
+        finalFile = tempFile+'.mp4';
+      }
+      if(!fs.existsSync(finalFile)){
+        throw new Error('فشل تحميل الملف من yt-dlp');
+      }
+      res.setHeader('Content-Disposition',`attachment; filename="${encodeURIComponent(filename)}"`);
+      res.setHeader('Content-Type','video/mp4');
+      res.setHeader('Content-Length',fs.statSync(finalFile).size);
+      fs.createReadStream(finalFile).pipe(res).on('finish',()=>{ fs.unlink(finalFile,()=>{}); });
+      return;
     }
-  } catch (e) {
-    console.error(`[MP4 ERROR] ${platform}:`, e.message);
-    if (!res.headersSent) res.status(500).json({ error: `${platform}: ${e.message}`, platform, isolated: true });
+  }catch(e){
+    console.error(`[MP4 ERROR] ${platform}:`,e.message);
+    if(!res.headersSent) res.status(500).json({error:`${platform}: ${e.message}`, platform, isolated:true});
   }
 });
 
-// ================= DOWNLOAD MP3 ISOLATED =================
-app.get('/api/download-mp3', async (req, res) => {
-  const { url, title } = req.query;
-  if (!url) return res.status(400).json({ error: 'رابط مطلوب' });
+// ================= DOWNLOAD MP3 - منفصل =================
+app.get('/api/download-mp3', async (req,res)=>{
+  const {url, title}=req.query;
+  if(!url) return res.status(400).json({error:'رابط مطلوب'});
   const platform = detectPlatform(url);
-  const safeTitle = sanitizeTitle(title || 'audio');
+  const safeTitle = sanitizeTitle(title||'audio');
   const filename = `${safeTitle}.mp3`;
   console.log(`[MP3] ${platform} | ${filename}`);
-  try {
-    if (platform === 'youtube') {
+  try{
+    if(platform==='youtube'){
       const info = await getYouTubeInfo(url);
-      const audioFormat = info.formats.filter(f=>f.hasAudio && !f.hasVideo).sort((a,b)=>b.bitrate-a.bitrate)[0] || info.formats.find(f=>f.hasAudio);
-      if (!audioFormat) throw new Error('لا يوجد صوت');
-      res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(filename)}"`);
-      res.setHeader('Content-Type', 'audio/mpeg');
-      const stream = ytdl.downloadFromInfo(info, { format: audioFormat });
-      const tempAudio = path.join(os.tmpdir(), `a_${Date.now()}.mp4`);
-      const tempMp3 = path.join(os.tmpdir(), `${Date.now()}.mp3`);
-      const ws = fs.createWriteStream(tempAudio);
+      const af = info.formats.filter(f=>f.hasAudio && !f.hasVideo).sort((a,b)=>b.bitrate-a.bitrate)[0] || info.formats.find(f=>f.hasAudio);
+      if(!af) throw new Error('لا يوجد صوت');
+      res.setHeader('Content-Disposition',`attachment; filename="${encodeURIComponent(filename)}"`);
+      res.setHeader('Content-Type','audio/mpeg');
+      const stream = ytdl.downloadFromInfo(info,{format:af});
+      const tmpA = path.join(os.tmpdir(),`a_${Date.now()}.mp4`);
+      const tmpM = path.join(os.tmpdir(),`${Date.now()}.mp3`);
+      const ws = fs.createWriteStream(tmpA);
       stream.pipe(ws);
-      ws.on('finish', () => {
-        ffmpeg(tempAudio).audioCodec('libmp3lame').audioBitrate(192).save(tempMp3)
-          .on('end', () => {
-            res.setHeader('Content-Length', fs.statSync(tempMp3).size);
-            fs.createReadStream(tempMp3).pipe(res).on('finish', () => { try{fs.unlinkSync(tempAudio);fs.unlinkSync(tempMp3);}catch(e){} });
-          })
-          .on('error', e => { console.error(e); if(!res.headersSent) res.status(500).json({error:e.message}); });
+      ws.on('finish',()=>{
+        ffmpeg(tmpA).audioCodec('libmp3lame').audioBitrate(192).save(tmpM)
+          .on('end',()=>{ res.setHeader('Content-Length',fs.statSync(tmpM).size); fs.createReadStream(tmpM).pipe(res).on('finish',()=>{ try{fs.unlinkSync(tmpA);fs.unlinkSync(tmpM);}catch(e){} }); })
+          .on('error',e=>{ if(!res.headersSent) res.status(500).json({error:e.message}); });
       });
-      stream.on('error', e => { if(!res.headersSent) res.status(500).json({error:e.message}); });
+      stream.on('error',e=>{ if(!res.headersSent) res.status(500).json({error:e.message}); });
       return;
-    } else {
-      return res.status(501).json({ error: `${platform} MP3 يحتاج yt-dlp`, platform, isolated: true });
+    }else{
+      if(!ytdlp) return res.status(500).json({error:`${platform} MP3 يحتاج yt-dlp-exec`, platform, isolated:true});
+      const tempBase = path.join(os.tmpdir(), `${Date.now()}_${safeTitle}`);
+      await ytdlp(url,{output:tempBase+'.%(ext)s', extractAudio:true, audioFormat:'mp3', audioQuality:0, noPlaylist:true});
+      const mp3File = tempBase+'.mp3';
+      let finalFile = mp3File;
+      if(!fs.existsSync(mp3File)){
+        const found = fs.readdirSync(os.tmpdir()).find(f=>f.startsWith(path.basename(tempBase)) && f.endsWith('.mp3'));
+        if(found) finalFile = path.join(os.tmpdir(), found);
+      }
+      if(!fs.existsSync(finalFile)) throw new Error('فشل تحويل MP3');
+      res.setHeader('Content-Disposition',`attachment; filename="${encodeURIComponent(filename)}"`);
+      res.setHeader('Content-Type','audio/mpeg');
+      res.setHeader('Content-Length',fs.statSync(finalFile).size);
+      fs.createReadStream(finalFile).pipe(res).on('finish',()=>{ fs.unlink(finalFile,()=>{}); });
+      return;
     }
-  } catch (e) {
-    console.error(`[MP3 ERROR] ${platform}:`, e.message);
-    if (!res.headersSent) res.status(500).json({ error: `${platform}: ${e.message}`, platform, isolated: true });
+  }catch(e){
+    console.error(`[MP3 ERROR] ${platform}:`,e.message);
+    if(!res.headersSent) res.status(500).json({error:`${platform}: ${e.message}`, platform, isolated:true});
   }
 });
 
-app.get('/health', (req,res) => {
-  res.json({ status:'ok', version:'V31-isolated-mp4-mp3', platforms:['youtube','tiktok','instagram','facebook','twitter','snapchat'], isolated:true, features:['mp4','mp3','anti-ban'], ts:new Date().toISOString() });
-});
+app.get('/health',(req,res)=>{ res.json({status:'ok', version:'V32-full-isolated', platforms:['youtube','tiktok','instagram','facebook','twitter','snapchat'], isolated:true, ytdlp:!!ytdlp, features:['mp4','mp3','anti-ban'], ts:new Date().toISOString()}); });
+app.get('/',(req,res)=>{ res.json({name:'LAQTA V32 Full Isolated', message:'كل منصة معزولة - يوتيوب + تيك توك + انستا + فيسبوك + تويتر + سناب', ytdlp:!!ytdlp}); });
 
-app.get('/', (req,res) => {
-  res.json({ name:'LAQTA V31 Isolated', message:'كل منصة معزولة - لو صار باند الباقي يشتغل', endpoints:{info:'/api/info?url=LINK', mp4:'/api/download?url=LINK&quality=720&title=NAME', mp3:'/api/download-mp3?url=LINK&title=NAME'} });
-});
-
-app.listen(PORT, () => {
-  console.log(`🚀 LAQTA V31 Isolated on ${PORT}`);
-  console.log(`📌 Isolated platforms - anti-ban`);
-});
+app.listen(PORT,()=>{ console.log(`🚀 LAQTA V32 Full Isolated on ${PORT} | yt-dlp: ${!!ytdlp}`); });
