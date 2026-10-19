@@ -1,15 +1,14 @@
 {
-  "name": "laqta-backend-v30",
-  "version": "30.0.0-youtube-2026-fixed",
+  "name": "laqta-backend-v31",
+  "version": "31.0.0-youtube-fixed-final",
   "type": "module",
   "scripts": {
-    "start": "node server.js",
-    "postinstall": "node -e \"try{require('ffmpeg-static')}catch{}\""
+    "start": "node server.js"
   },
   "dependencies": {
-    "express": "^4.19.2",
     "cors": "^2.8.5",
+    "express": "^4.19.2",
     "ffmpeg-static": "^5.2.0",
-    "yt-dlp-exec": "^1.0.2"
+    "yt-dlp-exec": "^1.1.1"
   }
 }
