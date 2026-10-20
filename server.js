@@ -727,27 +727,35 @@ app.get('/api/download-mp3', async (req,res)=>{
 });
 
 app.get('/health',(req,res)=>{
-  res.json({ 
-    status:'ok', 
-    version:'V50-PRO-MULTI-QUALITY', 
-    ytdlpVersion, 
-    ytdlpLoaded: !!ytdlp, 
-    platforms:['youtube','tiktok','instagram','facebook','twitter','snapchat'],
-    features: ['multi-quality','h264-compat','cobalt-failover','oembed-fallback','hevc-to-h264','concurrent-download'],
-    ts: new Date().toISOString() 
-  });
+  try {
+    res.json({ 
+      status:'ok', 
+      version:'V50-PRO-MULTI-QUALITY', 
+      ytdlpVersion: ytDlpVersion || 'unknown', 
+      ytdlpLoaded: !!ytdlp, 
+      platforms:['youtube','tiktok','instagram','facebook','twitter','snapchat'],
+      features: ['multi-quality','h264-compat','cobalt-failover','oembed-fallback','hevc-to-h264','concurrent-download'],
+      ts: new Date().toISOString() 
+    });
+  } catch(e){
+    res.json({ status:'ok', version:'V50-PRO', error: e.message, ts: new Date().toISOString() });
+  }
 });
 app.get('/api/health',(req,res)=>{
-  res.json({ 
-    status:'ok', 
-    version:'V50-PRO-MULTI-QUALITY', 
-    ytdlpVersion, 
-    ytdlpLoaded: !!ytdlp, 
-    platforms:['youtube','tiktok','instagram','facebook','twitter','snapchat'],
-    features: ['multi-quality','h264-compat','cobalt-failover','oembed-fallback','hevc-to-h264','concurrent-download'],
-    ts: new Date().toISOString(), 
-    via:'netlify-proxy' 
-  });
+  try {
+    res.json({ 
+      status:'ok', 
+      version:'V50-PRO-MULTI-QUALITY', 
+      ytdlpVersion: ytDlpVersion || 'unknown', 
+      ytdlpLoaded: !!ytdlp, 
+      platforms:['youtube','tiktok','instagram','facebook','twitter','snapchat'],
+      features: ['multi-quality','h264-compat','cobalt-failover','oembed-fallback','hevc-to-h264','concurrent-download'],
+      ts: new Date().toISOString(), 
+      via:'netlify-proxy' 
+    });
+  } catch(e){
+    res.json({ status:'ok', version:'V50-PRO', via:'netlify-proxy', error: e.message, ts: new Date().toISOString() });
+  }
 });
 
 app.get('/',(req,res)=>{ 
