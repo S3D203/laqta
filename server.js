@@ -322,6 +322,9 @@ app.get('/api/download-mp3', async (req,res)=>{
 app.get('/health',(req,res)=>{
   res.json({ status:'ok', version:'V41-fixed-render', ytdlpVersion: ytDlpVersion, ytdlpLoaded: !!ytdlp, platforms:['youtube','tiktok','instagram','facebook','twitter','snapchat'], ts: new Date().toISOString() });
 });
+app.get('/api/health',(req,res)=>{
+  res.json({ status:'ok', version:'V41-fixed-render', ytdlpVersion: ytDlpVersion, ytdlpLoaded: !!ytdlp, platforms:['youtube','tiktok','instagram','facebook','twitter','snapchat'], ts: new Date().toISOString(), via:'netlify-proxy' });
+});
 
 app.get('/',(req,res)=>{ res.json({name:'LAQTA V41 Fixed', message:'نسخة مصلحة - yt-dlp + TikTok API fallback', ytdlpVersion: ytDlpVersion, ytdlpLoaded: !!ytdlp}); });
 
