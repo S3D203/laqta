@@ -252,9 +252,9 @@ app.get('/api/download', async (req,res)=>{
       
       const tempFile = path.join(os.tmpdir(), `${Date.now()}_${safeTitle}.mp4`);
       try{
+        const qNum = parseQuality(quality);
+        const formatStr = `best[height<=${qNum}]`;
         await ytdlp(finalUrl,{
-          const qNum = parseInt(quality) || 720;
-          const formatStr = qNum ? `best[height<=${qNum}]` : 'best';
           output: tempFile,
           format: formatStr,
           noPlaylist: true,
