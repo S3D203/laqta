@@ -36,6 +36,12 @@ function detectPlatform(url) {
   return 'generic';
 }
 
+function parseQuality(q){
+  if(!q) return 720;
+  const num = parseInt(String(q).replace(/[^0-9]/g,''));
+  return isNaN(num) ? 720 : num;
+}
+
 function sanitizeTitle(t) {
   if (!t) return 'video';
   return t.replace(/[<>:"/\\|?*\x00-\x1F]/g,'').replace(/\s+/g,'_').substring(0,80)||'video';
@@ -107,9 +113,11 @@ async function getTikTokInfoWithFallback(url) {
     noWarnings: true,
     noCheckCertificates: true,
     addHeader: [
-      'User-Agent:Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1',
+      'User-Agent:Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15',
       'Referer:https://www.tiktok.com/'
-    ]
+    ],
+    // Update yt-dlp to latest TikTok workaround
+    extractorArgs: 'tiktok:api_hostname=api16-normal-c-useast2a.tiktokv.com;app_info=7355728856975265797'
   };
 
   try {
@@ -200,12 +208,13 @@ app.get('/api/download', async (req,res)=>{
   const platform = detectPlatform(url);
   const safeTitle = sanitizeTitle(title||'video');
   const filename = `${safeTitle}.mp4`;
-  console.log(`[MP4] ${platform} | ${quality} | ${filename}`);
+  const qParsed = parseQuality(quality);
+  console.log(`[MP4] ${platform} | ${qParsed} (raw:${quality}) | ${filename}`);
   try{
     if(platform==='youtube'){
       const info = await getYouTubeInfo(url);
       const {videoWithAudio, videoOnly, audioOnly}=filterYouTubeFormats(info);
-      const target = parseInt(quality)||720;
+      const target = parseQuality(quality);
       let vf = videoWithAudio.find(f=>f.height===target) || videoWithAudio.sort((a,b)=>Math.abs(a.height-target)-Math.abs(b.height-target))[0] || videoOnly.find(f=>f.format?.height===target) || videoOnly[0];
       if(!vf) throw new Error('جودة غير موجودة');
       res.setHeader('Content-Disposition',`attachment; filename="${encodeURIComponent(filename)}"`);
@@ -244,8 +253,10 @@ app.get('/api/download', async (req,res)=>{
       const tempFile = path.join(os.tmpdir(), `${Date.now()}_${safeTitle}.mp4`);
       try{
         await ytdlp(finalUrl,{
+          const qNum = parseInt(quality) || 720;
+          const formatStr = qNum ? `best[height<=${qNum}]` : 'best';
           output: tempFile,
-          format: `best[height<=${quality||720}]`,
+          format: formatStr,
           noPlaylist: true,
           noWarnings: true,
           addHeader: platform==='tiktok' ? ['User-Agent:Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15'] : []
