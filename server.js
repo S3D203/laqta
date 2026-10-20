@@ -20,9 +20,11 @@ const PORT = process.env.PORT || 10000;
 let ytdlp = null;
 try {
   ytdlp = require('yt-dlp-exec');
-  console.log('✅ yt-dlp-exec loaded');
+  console.log('✅ yt-dlp-exec 1.0.2 loaded');
+  // Try get yt-dlp version
+  ytdlp('--version').then(v=>console.log('yt-dlp binary version:', v)).catch(()=>{});
 } catch (e) {
-  console.log('⚠️ yt-dlp-exec not found');
+  console.log('⚠️ yt-dlp-exec not found:', e.message);
 }
 
 function detectPlatform(url) {
@@ -47,17 +49,16 @@ function sanitizeTitle(t) {
   return t.replace(/[<>:"/\\|?*\x00-\x1F]/g,'').replace(/\s+/g,'_').substring(0,80)||'video';
 }
 
-// Resolve short URLs like tt.site, vm.tiktok
 async function resolveUrl(shortUrl) {
   try {
     const res = await axios.get(shortUrl, {
       maxRedirects: 5,
       headers: {
-        'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15'
+        'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15',
+        'Accept': 'text/html'
       },
       validateStatus: (s) => s < 400
     });
-    // axios follows redirects, final url is in request
     return res.request?.res?.responseUrl || res.request?._redirectable?._currentUrl || shortUrl;
   } catch (e) {
     return e.response?.request?.res?.responseUrl || shortUrl;
@@ -92,51 +93,118 @@ function filterYouTubeFormats(info) {
   return {qualities:Array.from(map.values()).sort((a,b)=>b.height-a.height), videoWithAudio, videoOnly, audioOnly};
 }
 
-// TikTok with better options and fallback
+// ============ TIKTOK FALLBACK API (يحل مشكلة حظر Render) ============
+async function getTikTokViaApi(url) {
+  // جرب أكثر من API بديل
+  const apis = [
+    {
+      name: 'tikwm',
+      fn: async (u) => {
+        const res = await axios.post('https://www.tikwm.com/api/', { url: u }, {
+          headers: {
+            'Content-Type': 'application/json',
+            'User-Agent': 'Mozilla/5.0',
+            'Referer': 'https://www.tikwm.com/'
+          },
+          timeout: 15000
+        });
+        if (res.data && res.data.data) {
+          const d = res.data.data;
+          return {
+            title: d.title || 'TikTok Video',
+            cover: d.cover || d.origin_cover || '',
+            author: d.author?.nickname || d.author?.unique_id || '',
+            videoUrl: d.play || d.hdplay || d.wmplay || '',
+            musicUrl: d.music || ''
+          };
+        }
+        throw new Error('tikwm no data');
+      }
+    },
+    {
+      name: 'tiklydown',
+      fn: async (u) => {
+        const res = await axios.get(`https://api.tiklydown.eu.org/api/download?url=${encodeURIComponent(u)}`, {
+          timeout: 15000,
+          headers: { 'User-Agent': 'Mozilla/5.0' }
+        });
+        if (res.data && res.data.video) {
+          return {
+            title: res.data.title || 'TikTok Video',
+            cover: res.data.cover || '',
+            author: '',
+            videoUrl: res.data.video.noWatermark || res.data.video.watermark || ''
+          };
+        }
+        throw new Error('tiklydown no data');
+      }
+    }
+  ];
+
+  for (const api of apis) {
+    try {
+      console.log(`[TikTok API] Trying ${api.name} for ${url.substring(0,60)}`);
+      const result = await api.fn(url);
+      if (result.videoUrl) {
+        console.log(`[TikTok API] ${api.name} success`);
+        return result;
+      }
+    } catch (e) {
+      console.log(`[TikTok API] ${api.name} failed: ${e.message.substring(0,100)}`);
+    }
+  }
+  throw new Error('كل APIs فشلت - تيك توك محظور من IP السيرفر');
+}
+
 async function getTikTokInfoWithFallback(url) {
-  if (!ytdlp) throw new Error('yt-dlp not loaded');
-  
   let finalUrl = url;
-  // Resolve short url first
   if (url.includes('tt.site') || url.includes('vm.tiktok') || url.includes('vt.tiktok')) {
     try {
       finalUrl = await resolveUrl(url);
       console.log(`[TikTok] Resolved ${url} -> ${finalUrl.substring(0,100)}`);
-    } catch (e) {
-      console.log(`[TikTok] Resolve failed, using original`);
+    } catch (e) {}
+  }
+
+  // أولاً جرب yt-dlp (لو اشتغل يكون أفضل جودة)
+  if (ytdlp) {
+    try {
+      const info = await ytdlp(finalUrl, {
+        dumpSingleJson: true,
+        noPlaylist: true,
+        noWarnings: true,
+        noCheckCertificates: true,
+        addHeader: ['User-Agent:Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15', 'Referer:https://www.tiktok.com/']
+      });
+      console.log(`[TikTok] yt-dlp success: ${info.title?.substring(0,50)}`);
+      return {
+        title: info.title || 'TikTok Video',
+        cover: info.thumbnail || '',
+        author: info.uploader || '',
+        duration: info.duration || 0,
+        videoUrl: null, // yt-dlp will download directly
+        method: 'yt-dlp',
+        rawInfo: info,
+        finalUrl
+      };
+    } catch (e1) {
+      console.log(`[TikTok] yt-dlp failed: ${e1.message.substring(0,150)} - trying API fallback`);
     }
   }
 
-  const ytDlpOptions = {
-    dumpSingleJson: true,
-    noPlaylist: true,
-    noWarnings: true,
-    noCheckCertificates: true,
-    addHeader: [
-      'User-Agent:Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15',
-      'Referer:https://www.tiktok.com/'
-    ],
-    // Update yt-dlp to latest TikTok workaround
-    extractorArgs: 'tiktok:api_hostname=api16-normal-c-useast2a.tiktokv.com;app_info=7355728856975265797'
-  };
-
+  // Fallback: استخدم API بديل (يحل مشكلة حظر IP)
   try {
-    const info = await ytdlp(finalUrl, ytDlpOptions);
-    return info;
-  } catch (e1) {
-    console.log(`[TikTok] First try failed: ${e1.message.substring(0,200)}`);
-    // Retry with different options - without addHeader, with extractor args
-    try {
-      const info2 = await ytdlp(finalUrl, {
-        dumpSingleJson: true,
-        noPlaylist: true,
-        extractorArgs: 'tiktok:api_hostname=api16-normal-c-useast2a.tiktokv.com'
-      });
-      return info2;
-    } catch (e2) {
-      console.log(`[TikTok] Second try failed: ${e2.message.substring(0,200)}`);
-      throw new Error(`TikTok محظور مؤقتاً من السيرفر. جرب رابط مباشر من tiktok.com بدون tt.site. الخطأ: ${e1.message.substring(0,100)}`);
-    }
+    const apiResult = await getTikTokViaApi(finalUrl);
+    return {
+      title: apiResult.title,
+      cover: apiResult.cover,
+      author: apiResult.author,
+      duration: 0,
+      videoUrl: apiResult.videoUrl,
+      method: 'api-fallback',
+      finalUrl
+    };
+  } catch (e) {
+    throw new Error(`TikTok فشل: ${e.message}`);
   }
 }
 
@@ -144,19 +212,31 @@ app.get('/api/info', async (req,res)=>{
   const {url}=req.query;
   if(!url) return res.status(400).json({error:'رابط مطلوب'});
   const platform = detectPlatform(url);
-  console.log(`[INFO] ${platform} | ${url.substring(0,100)}`);
+  console.log(`[INFO] ${platform} | ${url.substring(0,100)} | yt-dlp:${!!ytdlp}`);
   try{
     if(platform==='youtube'){
       const info = await getYouTubeInfo(url);
       const {qualities}=filterYouTubeFormats(info);
-      return res.json({platform:'youtube', title:info.videoDetails.title, safeTitle:sanitizeTitle(info.videoDetails.title), author:info.videoDetails.author?.name||'', duration:parseInt(info.videoDetails.lengthSeconds)||0, cover:info.videoDetails.thumbnails?.slice(-1)[0]?.url||'', qualities, originalUrl:url, method:'ytdl-isolated'});
+      return res.json({platform:'youtube', title:info.videoDetails.title, safeTitle:sanitizeTitle(info.videoDetails.title), author:info.videoDetails.author?.name||'', duration:parseInt(info.videoDetails.lengthSeconds)||0, cover:info.videoDetails.thumbnails?.slice(-1)[0]?.url||'', qualities, originalUrl:url, method:'ytdl-isolated', ytdlpVersion: '1.0.2'});
     } else if(platform==='tiktok'){
       try{
         const info = await getTikTokInfoWithFallback(url);
-        return res.json({platform:'tiktok', title:info.title||'TikTok Video', safeTitle:sanitizeTitle(info.title||'tiktok'), author:info.uploader||'', duration:info.duration||0, cover:info.thumbnail||'', qualities:[{height:720, quality:'720p', label:'HD - بدون علامة مائية', hasAudio:true}], originalUrl:url, method:'yt-dlp-tiktok-isolated'});
+        return res.json({
+          platform:'tiktok',
+          title:info.title||'TikTok Video',
+          safeTitle:sanitizeTitle(info.title||'tiktok'),
+          author:info.author||'',
+          duration:info.duration||0,
+          cover:info.cover||'',
+          qualities:[{height:720, quality:'720p', label:'HD - بدون علامة مائية', hasAudio:true}],
+          originalUrl:url,
+          finalUrl: info.finalUrl,
+          method: info.method,
+          videoUrl: info.videoUrl ? 'ready' : 'yt-dlp',
+          ytdlpVersion: '1.0.2 with API fallback'
+        });
       }catch(e){
         console.error(`[TikTok INFO ERROR]:`, e.message);
-        // Isolated error - return 200 with fallback so frontend shows message but other platforms work
         return res.status(200).json({
           platform:'tiktok',
           title:'TikTok Video',
@@ -166,22 +246,22 @@ app.get('/api/info', async (req,res)=>{
           cover:'',
           qualities:[],
           originalUrl:url,
-          method:'tiktok-fallback',
+          method:'failed',
           warning: e.message,
           errorIsolated: true,
-          suggestion: 'جرب رابط tiktok.com مباشر بدل tt.site، أو حدث yt-dlp: pip install -U yt-dlp'
+          ytdlpVersion: '1.0.2',
+          suggestion: 'تيك توك يحظر IP السيرفر - جرب API fallback أو استخدم سيرفر ب IP مختلف'
         });
       }
     } else {
       if(!ytdlp){
-        return res.json({platform, title:`${platform} Video`, safeTitle:`${platform}_video`, author:'', duration:0, cover:'', qualities:[{height:720, quality:'720p', label:'HD', hasAudio:true}], originalUrl:url, method:'isolated-fallback'});
+        return res.json({platform, title:`${platform} Video`, safeTitle:`${platform}_video`, author:'', duration:0, cover:'', qualities:[{height:720, quality:'720p', label:'HD', hasAudio:true}], originalUrl:url, method:'isolated-fallback', ytdlpVersion:'none'});
       }
       try{
         const info = await ytdlp(url,{dumpSingleJson:true, noPlaylist:true, noWarnings:true});
-        return res.json({platform, title:info.title||`${platform} Video`, safeTitle:sanitizeTitle(info.title||platform), author:info.uploader||'', duration:info.duration||0, cover:info.thumbnail||'', qualities:[{height:720, quality:'720p', label:'HD', hasAudio:true}], originalUrl:url, method:'yt-dlp-isolated'});
+        return res.json({platform, title:info.title||`${platform} Video`, safeTitle:sanitizeTitle(info.title||platform), author:info.uploader||'', duration:info.duration||0, cover:info.thumbnail||'', qualities:[{height:720, quality:'720p', label:'HD', hasAudio:true}], originalUrl:url, method:'yt-dlp-isolated', ytdlpVersion:'1.0.2'});
       }catch(e){
         console.error(`[${platform} INFO ERROR]:`, e.message);
-        // Isolated - don't crash other platforms
         return res.status(200).json({
           platform,
           title:`${platform} Video`,
@@ -192,13 +272,14 @@ app.get('/api/info', async (req,res)=>{
           qualities:[],
           originalUrl:url,
           warning: e.message,
-          errorIsolated: true
+          errorIsolated: true,
+          ytdlpVersion:'1.0.2'
         });
       }
     }
   }catch(e){
     console.error(`[INFO ERROR] ${platform}:`,e.message);
-    res.status(500).json({error:`${platform}: ${e.message}`, platform, isolated:true});
+    res.status(500).json({error:`${platform}: ${e.message}`, platform, isolated:true, ytdlpVersion:'1.0.2'});
   }
 });
 
@@ -208,14 +289,13 @@ app.get('/api/download', async (req,res)=>{
   const platform = detectPlatform(url);
   const safeTitle = sanitizeTitle(title||'video');
   const filename = `${safeTitle}.mp4`;
-  const qParsed = parseQuality(quality);
-  console.log(`[MP4] ${platform} | ${qParsed} (raw:${quality}) | ${filename}`);
+  const qNum = parseQuality(quality);
+  console.log(`[MP4] ${platform} | ${qNum} | ${filename} | yt-dlp:${!!ytdlp}`);
   try{
     if(platform==='youtube'){
       const info = await getYouTubeInfo(url);
       const {videoWithAudio, videoOnly, audioOnly}=filterYouTubeFormats(info);
-      const target = parseQuality(quality);
-      let vf = videoWithAudio.find(f=>f.height===target) || videoWithAudio.sort((a,b)=>Math.abs(a.height-target)-Math.abs(b.height-target))[0] || videoOnly.find(f=>f.format?.height===target) || videoOnly[0];
+      let vf = videoWithAudio.find(f=>f.height===qNum) || videoWithAudio.sort((a,b)=>Math.abs(a.height-qNum)-Math.abs(b.height-qNum))[0] || videoOnly.find(f=>f.format?.height===qNum) || videoOnly[0];
       if(!vf) throw new Error('جودة غير موجودة');
       res.setHeader('Content-Disposition',`attachment; filename="${encodeURIComponent(filename)}"`);
       res.setHeader('Content-Type','video/mp4');
@@ -241,42 +321,83 @@ app.get('/api/download', async (req,res)=>{
           .on('error',e=>{ if(!res.headersSent) res.status(500).json({error:'فشل دمج'}); });
       }
       return;
-    }else{
-      if(!ytdlp) return res.status(500).json({error:`${platform} يحتاج yt-dlp`, platform, isolated:true});
+    }else if(platform==='tiktok'){
+      // TikTok download with API fallback
+      let finalUrl = url;
+      if(url.includes('tt.site') || url.includes('vm.tiktok') || url.includes('vt.tiktok')){
+        try{ finalUrl = await resolveUrl(url); }catch(e){}
+      }
       
-      // For tiktok, resolve short url first
+      // أولاً جرب yt-dlp
+      if(ytdlp){
+        const tempFile = path.join(os.tmpdir(), `${Date.now()}_${safeTitle}.mp4`);
+        try{
+          const formatStr = `best[height<=${qNum}]`;
+          console.log(`[TikTok] Trying yt-dlp: ${finalUrl.substring(0,60)} format:${formatStr}`);
+          await ytdlp(finalUrl,{
+            output: tempFile,
+            format: formatStr,
+            noPlaylist: true,
+            noWarnings: true
+          });
+          let finalFile = tempFile;
+          if(!fs.existsSync(tempFile)) finalFile = tempFile+'.mp4';
+          if(fs.existsSync(finalFile)){
+            console.log(`[TikTok] yt-dlp download success`);
+            res.setHeader('Content-Disposition',`attachment; filename="${encodeURIComponent(filename)}"`);
+            res.setHeader('Content-Type','video/mp4');
+            res.setHeader('Content-Length',fs.statSync(finalFile).size);
+            fs.createReadStream(finalFile).pipe(res).on('finish',()=>{ fs.unlink(finalFile,()=>{}); });
+            return;
+          }
+        }catch(e){
+          console.log(`[TikTok] yt-dlp download failed: ${e.message.substring(0,150)} - trying API`);
+        }
+      }
+      
+      // Fallback: استخدم API مباشر
+      try{
+        const apiResult = await getTikTokViaApi(finalUrl);
+        if(apiResult.videoUrl){
+          console.log(`[TikTok] API download: ${apiResult.videoUrl.substring(0,80)}`);
+          res.setHeader('Content-Disposition',`attachment; filename="${encodeURIComponent(filename)}"`);
+          res.setHeader('Content-Type','video/mp4');
+          // Stream directly from API URL
+          const videoRes = await axios.get(apiResult.videoUrl, { responseType: 'stream', timeout: 30000, headers: { 'User-Agent':'Mozilla/5.0', 'Referer':'https://www.tikwm.com/' } });
+          videoRes.data.pipe(res);
+          return;
+        }
+      }catch(e){
+        console.error(`[TikTok API DL ERROR]:`, e.message);
+      }
+      
+      return res.status(500).json({error:`TikTok فشل التحميل - IP محظور. جرب تحديث yt-dlp: pip install -U yt-dlp`, platform:'tiktok', isolated:true, ytdlpVersion:'1.0.2', finalUrl});
+    }else{
+      if(!ytdlp) return res.status(500).json({error:`${platform} يحتاج yt-dlp`, platform, isolated:true, ytdlpVersion:'none'});
       let finalUrl = url;
       if(platform==='tiktok' && (url.includes('tt.site') || url.includes('vm.tiktok') || url.includes('vt.tiktok'))){
         try{ finalUrl = await resolveUrl(url); }catch(e){}
       }
-      
       const tempFile = path.join(os.tmpdir(), `${Date.now()}_${safeTitle}.mp4`);
       try{
-        const qNum = parseQuality(quality);
         const formatStr = `best[height<=${qNum}]`;
         await ytdlp(finalUrl,{
           output: tempFile,
           format: formatStr,
           noPlaylist: true,
-          noWarnings: true,
-          addHeader: platform==='tiktok' ? ['User-Agent:Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15'] : []
+          noWarnings: true
         });
       }catch(e){
         console.error(`[${platform} DL ERROR]:`, e.message);
-        return res.status(500).json({error:`${platform}: ${e.message.substring(0,200)} - جرب رابط مباشر`, platform, isolated:true});
+        return res.status(500).json({error:`${platform}: ${e.message.substring(0,200)}`, platform, isolated:true, ytdlpVersion:'1.0.2'});
       }
-      
       let finalFile = tempFile;
-      if(!fs.existsSync(tempFile)){
-        finalFile = tempFile+'.mp4';
-      }
+      if(!fs.existsSync(tempFile)) finalFile = tempFile+'.mp4';
       if(!fs.existsSync(finalFile)){
-        // search
         const found = fs.readdirSync(os.tmpdir()).find(f=>f.includes(safeTitle.substring(0,10)) && f.endsWith('.mp4'));
         if(found) finalFile = path.join(os.tmpdir(), found);
       }
       if(!fs.existsSync(finalFile)) throw new Error('فشل تحميل');
-      
       res.setHeader('Content-Disposition',`attachment; filename="${encodeURIComponent(filename)}"`);
       res.setHeader('Content-Type','video/mp4');
       res.setHeader('Content-Length',fs.statSync(finalFile).size);
@@ -285,7 +406,7 @@ app.get('/api/download', async (req,res)=>{
     }
   }catch(e){
     console.error(`[MP4 ERROR] ${platform}:`,e.message);
-    if(!res.headersSent) res.status(500).json({error:`${platform}: ${e.message}`, platform, isolated:true});
+    if(!res.headersSent) res.status(500).json({error:`${platform}: ${e.message}`, platform, isolated:true, ytdlpVersion:'1.0.2'});
   }
 });
 
@@ -337,11 +458,23 @@ app.get('/api/download-mp3', async (req,res)=>{
     }
   }catch(e){
     console.error(`[MP3 ERROR] ${platform}:`,e.message);
-    if(!res.headersSent) res.status(500).json({error:`${platform}: ${e.message}`, platform, isolated:true});
+    if(!res.headersSent) res.status(500).json({error:`${platform}: ${e.message}`, platform, isolated:true, ytdlpVersion:'1.0.2'});
   }
 });
 
-app.get('/health',(req,res)=>{ res.json({status:'ok', version:'V33-tiktok-fix', platforms:['youtube','tiktok','instagram','facebook','twitter','snapchat'], isolated:true, ytdlp:!!ytdlp, fix:'tt.site resolved + isolated errors', ts:new Date().toISOString()}); });
-app.get('/',(req,res)=>{ res.json({name:'LAQTA V33 TikTok Fix', message:'تيك توك مصلح - يدعم tt.site + معزول', ytdlp:!!ytdlp}); });
+app.get('/health',(req,res)=>{ 
+  res.json({
+    status:'ok', 
+    version:'V35-tiktok-api-fallback',
+    ytdlpVersion:'1.0.2',
+    ytdlpLoaded: !!ytdlp,
+    platforms:['youtube','tiktok','instagram','facebook','twitter','snapchat'],
+    isolated:true,
+    features:['mp4','mp3','anti-ban','tiktok-api-fallback','tt.site-resolver'],
+    ts:new Date().toISOString()
+  }); 
+});
 
-app.listen(PORT,()=>{ console.log(`🚀 LAQTA V33 TikTok Fix on ${PORT} | yt-dlp: ${!!ytdlp}`); });
+app.get('/',(req,res)=>{ res.json({name:'LAQTA V35 TikTok API Fallback', message:'تيك توك مصلح ب API بديل يحل مشكلة حظر IP', ytdlpVersion:'1.0.2', ytdlpLoaded:!!ytdlp}); });
+
+app.listen(PORT,()=>{ console.log(`🚀 LAQTA V35 TikTok API Fallback on ${PORT} | yt-dlp: ${!!ytdlp} v1.0.2 | 6 platforms isolated`); });
