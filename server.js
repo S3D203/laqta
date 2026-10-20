@@ -3,7 +3,12 @@ const express = require('express');
 const cors = require('cors');
 const ffmpeg = require('fluent-ffmpeg');
 const ffmpegPath = require('@ffmpeg-installer/ffmpeg').path;
-const ffprobePath = require('@ffprobe-installer/ffprobe').path;
+let ffprobePath = null;
+try {
+  ffprobePath = require('@ffprobe-installer/ffprobe').path;
+} catch(e) {
+  console.log('⚠️ ffprobe not installed, HEVC detection disabled');
+}
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
@@ -11,7 +16,7 @@ const axios = require('axios');
 const { execSync } = require('child_process');
 
 ffmpeg.setFfmpegPath(ffmpegPath);
-ffmpeg.setFfprobePath(ffprobePath);
+if(ffprobePath) ffmpeg.setFfprobePath(ffprobePath);
 
 const app = express();
 app.use(cors({ origin: '*' }));
@@ -192,6 +197,7 @@ function transcodeToH264(inputPath, outputPath){
 
 function checkIsHevc(filePath){
   return new Promise((resolve)=>{
+    if(!ffprobePath) return resolve(false); // skip if no ffprobe
     ffmpeg.ffprobe(filePath, (err, metadata)=>{
       if(err) return resolve(false);
       const videoStream = metadata.streams.find(s=>s.codec_type==='video');
